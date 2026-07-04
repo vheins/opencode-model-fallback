@@ -4,7 +4,7 @@
 
   "plugin": [
     [
-      "opencode-model-fallback",
+      "@vheins/opencode-model-fallback",
       {
         "fallbacks": {
           "anthropic/claude-sonnet-4-6": [
