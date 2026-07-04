@@ -50,8 +50,11 @@ export default async function modelFallbackPlugin(
 
   return {
     "chat.params": async (chatInput, _output) => {
-      const modelKey = key(chatInput.provider.info.id, chatInput.model.id)
-      sessionModel.set(chatInput.sessionID, modelKey)
+      const providerId = chatInput.provider?.info?.id
+      const modelId = chatInput.model?.id
+      if (providerId && modelId) {
+        sessionModel.set(chatInput.sessionID, key(providerId, modelId))
+      }
     },
 
     event: async ({ event }) => {
