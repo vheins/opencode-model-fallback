@@ -1,5 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin/v2/promise"
-import type { LanguageModelV3, LanguageModelV3StreamResult, LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import type { PluginInput, PluginOptions, Hooks } from "@opencode-ai/plugin"
 
 interface FallbackOptions {
   fallbacks: Record<string, string[]>
@@ -19,138 +18,83 @@ function key(providerID: string, modelID: string): string {
   return `${providerID}/${modelID}`
 }
 
-function findNext(
-  failed: ReadonlySet<string>,
-  primary: string,
-  fallbacks: Record<string, string[]>,
-): string | null {
-  if (!failed.has(primary)) return primary
-  const chain = fallbacks[primary] ?? []
-  for (const fb of chain) {
-    if (!failed.has(fb)) return fb
-  }
-  return null
-}
+const sessionModel = new Map<string, string>()
+const sessionFailures = new Map<string, Set<string>>()
+const sessionLastFailure = new Map<string, number>()
 
-function wrapModel(
-  primaryKey: string,
-  original: LanguageModelV3,
-  sdk: { languageModel(id: string): LanguageModelV3 },
-  apiIdLookup: Record<string, string>,
-  opts: FallbackOptions,
-  state: { failed: Set<string>; retries: number; lastFailure: number; cooldownMs: number; maxRetries: number },
-): LanguageModelV3 {
-  const tryFallback = async <T>(
-    call: (model: LanguageModelV3) => PromiseLike<T>,
-  ): Promise<T> => {
-    let lastErr: unknown
-    let currentKey = primaryKey
+export default async function modelFallbackPlugin(
+  input: PluginInput,
+  options?: PluginOptions,
+): Promise<Hooks> {
+  const opts = parse(options ?? {})
+  const fallbackKeys = Object.keys(opts.fallbacks)
+  if (fallbackKeys.length === 0) return {}
 
-    for (let attempt = 0; attempt <= state.maxRetries; attempt++) {
-      if (state.failed.has(currentKey)) {
-        state.retries++
-        state.lastFailure = Date.now()
+  let switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined
 
-        const nextKey = findNext(state.failed, primaryKey, opts.fallbacks)
-        if (!nextKey) throw lastErr ?? new Error(`[model-fallback] all models exhausted for ${primaryKey}`)
-
-        const nextApiId = apiIdLookup[nextKey]
-        if (!nextApiId) throw lastErr ?? new Error(`[model-fallback] unknown model: ${nextKey}`)
-
-        const fbModel = sdk.languageModel(nextApiId)
-        console.log(`[model-fallback] ${primaryKey} -> ${nextKey}`)
-        currentKey = nextKey
-        return await call(fbModel)
-      }
-
-      try {
-        return await call(currentKey === primaryKey ? original : sdk.languageModel(apiIdLookup[currentKey]))
-      } catch (err) {
-        state.failed.add(currentKey)
-        lastErr = err
-        console.log(`[model-fallback] error on ${currentKey}:`, (err as Error)?.message ?? err)
-      }
+  try {
+    const mod = await import("@opencode-ai/sdk/v2/client")
+    const v2Client = mod.createOpencodeClient({
+      baseUrl: input.serverUrl.toString(),
+      directory: input.directory,
+    })
+    switchModel = async (sessionID, providerID, modelID) => {
+      await v2Client.v2.session.switchModel({
+        sessionID,
+        model: { id: modelID, providerID },
+      })
     }
-
-    throw lastErr
+  } catch {
+    console.warn("[model-fallback] couldn't initialize v2 client; model switching disabled")
   }
 
   return {
-    specificationVersion: "v3" as const,
-    provider: original.provider,
-    modelId: original.modelId,
-    supportedUrls: original.supportedUrls,
-
-    doGenerate(options: LanguageModelV3CallOptions) {
-      return tryFallback((m) => m.doGenerate(options))
+    "chat.params": async (chatInput, _output) => {
+      const modelKey = key(chatInput.provider.info.id, chatInput.model.id)
+      sessionModel.set(chatInput.sessionID, modelKey)
     },
 
-    doStream(options: LanguageModelV3CallOptions) {
-      return tryFallback((m) => m.doStream(options))
+    event: async ({ event }) => {
+      if (event.type !== "session.error") return
+      if (!switchModel) return
+
+      const props = event.properties as Record<string, unknown>
+      const sessionID = props.sessionID as string | undefined
+      if (!sessionID) return
+
+      const currentModel = sessionModel.get(sessionID)
+      if (!currentModel) return
+
+      const fallbackChain = opts.fallbacks[currentModel]
+      if (!fallbackChain || fallbackChain.length === 0) return
+
+      const now = Date.now()
+      const lastFail = sessionLastFailure.get(sessionID) ?? 0
+      if (now - lastFail < opts.cooldownMs) return
+
+      let failures = sessionFailures.get(sessionID)
+      if (!failures) {
+        failures = new Set()
+        sessionFailures.set(sessionID, failures)
+      }
+      failures.add(currentModel)
+
+      const nextModel = fallbackChain.find((m) => !failures!.has(m))
+      if (!nextModel) return
+
+      const [providerID, modelID] = nextModel.includes("/")
+        ? [nextModel.split("/")[0], nextModel.split("/")[1]!]
+        : ["", nextModel]
+
+      try {
+        await switchModel(sessionID, providerID, modelID)
+        sessionLastFailure.set(sessionID, now)
+        console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID})`)
+      } catch (e) {
+        console.error(`[model-fallback] failed to switch session ${sessionID} to ${nextModel}:`, e)
+      }
     },
   }
 }
 
-export const plugin: Plugin = {
-  id: "opencode-model-fallback",
 
-  async setup(context) {
-    const opts = parse(context.options)
-    const fallbackKeys = Object.keys(opts.fallbacks)
-    if (fallbackKeys.length === 0) return
-
-    // Resolve opencode model IDs ("provider/id") to provider API IDs ("api-model-id-v3")
-    const apiIdLookup: Record<string, string> = {}
-    let catalogLoaded = false
-
-    await context.catalog.transform((draft) => {
-      for (const provider of draft.provider.list()) {
-        for (const [modelID, info] of provider.models) {
-          apiIdLookup[key(provider.provider.id, modelID)] = info.api.id
-        }
-      }
-      catalogLoaded = true
-    })
-
-    // If catalog already loaded, transform runs synchronously
-    if (!catalogLoaded) {
-      console.warn("[model-fallback] catalog not yet loaded, fallback API ID resolution may be incomplete")
-    }
-
-    const state = {
-      failed: new Set<string>(),
-      retries: 0,
-      lastFailure: 0,
-      cooldownMs: opts.cooldownMs,
-      maxRetries: opts.maxRetries,
-    }
-
-    const now = () => {
-      if (state.lastFailure === 0) return false
-      if (Date.now() - state.lastFailure > state.cooldownMs) {
-        state.failed.clear()
-        state.retries = 0
-        return true
-      }
-      return false
-    }
-
-    context.aisdk.language((event) => {
-      const modelKey = key(event.model.providerID, event.model.id)
-      const hasEntry = fallbackKeys.includes(modelKey)
-      const isFallbackOf = fallbackKeys.some((k) => (opts.fallbacks[k] ?? []).includes(modelKey))
-
-      if (!hasEntry && !isFallbackOf) return
-      if (!event.sdk?.languageModel) return
-
-      now()
-
-      const original = event.sdk.languageModel(event.model.api.id)
-      if (!original) return
-
-      event.language = wrapModel(modelKey, original, event.sdk, apiIdLookup, opts, state)
-    })
-  },
-}
-
-export default plugin
