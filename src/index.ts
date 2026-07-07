@@ -1,7 +1,5 @@
 import type { PluginInput, PluginOptions, Hooks } from "@opencode-ai/plugin"
 
-console.log("[model-fallback] module loaded")
-
 interface OpencodeClient {
   app: {
     log: (params: {
@@ -174,10 +172,8 @@ export default async function modelFallbackPlugin(
   const client: any = (input as any).client
   const directory = input.directory
 
-  // Log to BOTH stdout and structured logs for maximum visibility
+  // Only use structured logging via client.app.log — console.* would corrupt the TUI
   function log(level: string, msg: string): void {
-    const prefix = `[model-fallback]`
-    console.error(`${prefix} ${msg}`)
     try {
       if (client?.app?.log) {
         client.app.log({
