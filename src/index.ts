@@ -177,13 +177,7 @@ export default async function modelFallbackPlugin(
   // Log to BOTH stdout and structured logs for maximum visibility
   function log(level: string, msg: string): void {
     const prefix = `[model-fallback]`
-    if (level === "error") {
-      console.error(`${prefix} ${msg}`)
-    } else if (level === "warn") {
-      console.warn(`${prefix} ${msg}`)
-    } else {
-      console.log(`${prefix} ${msg}`)
-    }
+    console.error(`${prefix} ${msg}`)
     try {
       if (client?.app?.log) {
         client.app.log({
