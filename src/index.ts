@@ -61,25 +61,26 @@ function extractErrorMessage(event: Record<string, unknown>): string | undefined
 }
 
 /**
- * Check if the error is likely retryable.
+ * Returns true if the error should trigger a model fallback.
  *
- * - APIError: strict classification using statusCode/isRetryable
- * - UnknownError / unclassified: assume retryable (the error likely
- *   wraps a provider failure like rate-limit that switching models fixes)
+ * For APIError: strict check for 429/503/isRetryable; everything else is
+ * assumed non-retryable (prevents wasting fallback on bad requests etc.).
+ * For all other error types (UnknownError etc.): assume retryable, because
+ * the error likely wraps a transient provider failure like rate limiting.
+ * The maxRetries + cooldownMs mechanism prevents runaway loops.
  */
 function isRetryableError(event: Record<string, unknown>): boolean {
   const props = event.properties as Record<string, unknown> | undefined
   if (props?.error) {
     const err = props.error as Record<string, unknown>
     const errName = err.name as string | undefined
-    const data = err.data as Record<string, unknown> | undefined
     if (errName === "APIError") {
+      const data = err.data as Record<string, unknown> | undefined
       if (data?.statusCode === 429 || data?.statusCode === 503) return true
       if (data?.isRetryable === true) return true
       return false
     }
-    // UnknownError or any other — assume retryable since we can't
-    // determine the nature of the provider error
+    // UnknownError — assume retryable (likely wraps a provider failure)
     return true
   }
   return false
@@ -124,8 +125,37 @@ export default async function modelFallbackPlugin(
       const eventAny = event as Record<string, unknown>
       const eventType = eventAny.type as string
 
-      // Capture model from step-start events — this is the ONLY reliable way
-      // to get model info for subagent sessions (chat.params doesn't fire for them).
+      // Capture model from session.created events (fires for ALL sessions
+      // including subagents, before any step starts).
+      if (eventType === "session.created") {
+        let sessionID: string | undefined
+        let model: { id?: string; providerID?: string } | undefined
+
+        // v1: properties.info.model
+        const props = eventAny.properties as Record<string, unknown> | undefined
+        if (props?.sessionID && props?.info) {
+          const info = props.info as Record<string, unknown>
+          sessionID = props.sessionID as string
+          model = info.model as { id?: string; providerID?: string } | undefined
+        }
+        // v2: data.info.model
+        if (!sessionID) {
+          const data = eventAny.data as Record<string, unknown> | undefined
+          if (data?.sessionID && data?.info) {
+            const info = data.info as Record<string, unknown>
+            sessionID = data.sessionID as string
+            model = info.model as { id?: string; providerID?: string } | undefined
+          }
+        }
+
+        if (sessionID && model?.id && model?.providerID) {
+          sessionModel.set(sessionID, key(model.providerID, model.id))
+        }
+        return
+      }
+
+      // Capture model from step-start events (backup for sessions that
+      // already started before the plugin was loaded).
       if (eventType === "session.next.step.started") {
         const data = eventAny.data as Record<string, unknown> | undefined
         if (data?.sessionID && data?.model) {
