@@ -169,20 +169,31 @@ export default async function modelFallbackPlugin(
   input: PluginInput,
   options?: PluginOptions,
 ): Promise<Hooks> {
-  const client = (input as any).client as OpencodeClient | undefined
+  const client: any = (input as any).client
   const directory = input.directory
 
+  // Log to BOTH stdout and structured logs for maximum visibility
   function log(level: string, msg: string): void {
+    const prefix = `[model-fallback]`
+    if (level === "error") {
+      console.error(`${prefix} ${msg}`)
+    } else if (level === "warn") {
+      console.warn(`${prefix} ${msg}`)
+    } else {
+      console.log(`${prefix} ${msg}`)
+    }
     try {
-      client?.app.log({
-        body: {
-          service: "model-fallback",
-          level: level as "debug" | "info" | "warn" | "error",
-          message: msg,
-          extra: { directory },
-        },
-        query: { directory },
-      }).catch(() => {})
+      if (client?.app?.log) {
+        client.app.log({
+          body: {
+            service: "model-fallback",
+            level: level as "debug" | "info" | "warn" | "error",
+            message: msg,
+            extra: { directory },
+          },
+          query: { directory },
+        }).catch(() => {})
+      }
     } catch {}
   }
 
