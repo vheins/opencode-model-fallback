@@ -39,6 +39,17 @@ function extractSessionID(event: Record<string, unknown>): string | undefined {
 }
 
 /**
+ * Extract the status object from a session.status event.
+ */
+function extractStatus(event: Record<string, unknown>): { type?: string; message?: string } | undefined {
+  const props = event.properties as Record<string, unknown> | undefined
+  if (props?.status) return props.status as { type?: string; message?: string }
+  const data = event.data as Record<string, unknown> | undefined
+  if (data?.status) return data.status as { type?: string; message?: string }
+  return undefined
+}
+
+/**
  * Extract the error message from an event for debugging.
  * Handles v1/v2 ApiError and SessionErrorUnknown shapes.
  */
@@ -84,6 +95,69 @@ function isRetryableError(event: Record<string, unknown>): boolean {
     return true
   }
   return false
+}
+
+/**
+ * Core fallback logic: find the next untried model in the fallback chain
+ * and call switchModel. Shared between error events and status-retry events.
+ */
+async function performFallback(
+  sessionID: string,
+  switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined,
+  opts: FallbackOptions,
+): Promise<void> {
+  if (!switchModel) return
+
+  const currentModel = sessionModel.get(sessionID)
+  if (!currentModel) return
+
+  const fallbackChain = opts.fallbacks[currentModel]
+  if (!fallbackChain || fallbackChain.length === 0) return
+
+  const now = Date.now()
+  const lastFail = sessionLastFailure.get(sessionID) ?? 0
+
+  // Cooldown expired → reset state so primary model gets retried
+  if (now - lastFail >= opts.cooldownMs) {
+    sessionFailures.delete(sessionID)
+    sessionRetries.delete(sessionID)
+  }
+
+  // Enforce maxRetries
+  const retries = (sessionRetries.get(sessionID) ?? 0) + 1
+  sessionRetries.set(sessionID, retries)
+  if (retries > opts.maxRetries) {
+    console.log(`[model-fallback] session ${sessionID}: max retries (${opts.maxRetries}) reached`)
+    return
+  }
+
+  // Find next untried model in the fallback chain
+  let failures = sessionFailures.get(sessionID)
+  if (!failures) {
+    failures = new Set()
+    sessionFailures.set(sessionID, failures)
+  }
+  failures.add(currentModel)
+
+  const nextModel = fallbackChain.find((m) => !failures!.has(m))
+  if (!nextModel) return
+
+  const [providerID, modelID] = nextModel.includes("/")
+    ? [nextModel.split("/")[0], nextModel.split("/")[1]!]
+    : ["", nextModel]
+
+  if (!providerID) {
+    console.warn(`[model-fallback] no provider in fallback target "${nextModel}", using empty providerID`)
+  }
+
+  try {
+    await switchModel(sessionID, providerID, modelID)
+    sessionLastFailure.set(sessionID, now)
+    console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID}, retry ${retries})`)
+  } catch (e) {
+    failures.add(nextModel)
+    console.error(`[model-fallback] failed to switch session ${sessionID} to ${nextModel}:`, e)
+  }
 }
 
 export default async function modelFallbackPlugin(
@@ -167,6 +241,21 @@ export default async function modelFallbackPlugin(
         return
       }
 
+      // Handle session.status with retry type (server scheduled a retry, e.g.
+      // "Free usage exceeded" goes to retry state instead of emitting an error)
+      if (eventType === "session.status") {
+        const status = extractStatus(eventAny)
+        if (status?.type === "retry" && status.message) {
+          const sid = extractSessionID(eventAny)
+          if (sid) {
+            const safeMsg = status.message.length > 200 ? status.message.slice(0, 200) + "..." : status.message
+            console.log(`[model-fallback] session ${sid} retry: ${safeMsg}`)
+            await performFallback(sid, switchModel, opts)
+          }
+        }
+        return
+      }
+
       // Handle session-level errors and step-level failures (e.g. stream rate-limit)
       if (eventType !== "session.error" && eventType !== "session.next.step.failed") return
       if (!switchModel) return
@@ -184,56 +273,7 @@ export default async function modelFallbackPlugin(
       // Only trigger on retryable errors (rate limit, server error, etc.)
       if (!isRetryableError(eventAny)) return
 
-      const currentModel = sessionModel.get(sessionID)
-      if (!currentModel) return
-
-      const fallbackChain = opts.fallbacks[currentModel]
-      if (!fallbackChain || fallbackChain.length === 0) return
-
-      const now = Date.now()
-      const lastFail = sessionLastFailure.get(sessionID) ?? 0
-
-      // Cooldown expired → reset state so primary model gets retried
-      if (now - lastFail >= opts.cooldownMs) {
-        sessionFailures.delete(sessionID)
-        sessionRetries.delete(sessionID)
-      }
-
-      // Enforce maxRetries
-      const retries = (sessionRetries.get(sessionID) ?? 0) + 1
-      sessionRetries.set(sessionID, retries)
-      if (retries > opts.maxRetries) {
-        console.log(`[model-fallback] session ${sessionID}: max retries (${opts.maxRetries}) reached`)
-        return
-      }
-
-      // Find next untried model in the fallback chain
-      let failures = sessionFailures.get(sessionID)
-      if (!failures) {
-        failures = new Set()
-        sessionFailures.set(sessionID, failures)
-      }
-      failures.add(currentModel)
-
-      const nextModel = fallbackChain.find((m) => !failures!.has(m))
-      if (!nextModel) return
-
-      const [providerID, modelID] = nextModel.includes("/")
-        ? [nextModel.split("/")[0], nextModel.split("/")[1]!]
-        : ["", nextModel]
-
-      if (!providerID) {
-        console.warn(`[model-fallback] no provider in fallback target "${nextModel}", using empty providerID`)
-      }
-
-      try {
-        await switchModel(sessionID, providerID, modelID)
-        sessionLastFailure.set(sessionID, now)
-        console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID}, retry ${retries})`)
-      } catch (e) {
-        failures.add(nextModel)
-        console.error(`[model-fallback] failed to switch session ${sessionID} to ${nextModel}:`, e)
-      }
+      await performFallback(sessionID, switchModel, opts)
     },
   }
 }
