@@ -183,6 +183,7 @@ export default async function modelFallbackPlugin(
   input: PluginInput,
   options?: PluginOptions,
 ): Promise<Hooks> {
+  console.log("[model-fallback] plugin init called")
   const opts = parse(options ?? {})
   const fallbackKeys = Object.keys(opts.fallbacks)
   console.log(`[model-fallback] loaded, fallbacks: ${fallbackKeys.length ? fallbackKeys.join(", ") : "none"}${opts.defaultFallbacks ? `, default: ${opts.defaultFallbacks.join(", ")}` : ""}, maxRetries: ${opts.maxRetries}, cooldownMs: ${opts.cooldownMs}`)
@@ -218,9 +219,7 @@ export default async function modelFallbackPlugin(
     event: async ({ event }) => {
       const eventAny = event as Record<string, unknown>
       const eventType = eventAny.type as string
-      if (eventType === "session.error" || eventType === "session.status" || eventType === "session.created" || eventType === "session.next.step.started" || eventType === "session.next.step.failed") {
-        console.log(`[model-fallback] event: ${eventType}`)
-      }
+      console.log(`[model-fallback] event: ${eventType}`)
 
       // Capture model from session.created events (fires for ALL sessions
       // including subagents, before any step starts).
