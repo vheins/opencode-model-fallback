@@ -99,6 +99,7 @@ function isRetryableError(event: Record<string, unknown>): boolean {
 async function performFallback(
   sessionID: string,
   switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined,
+  abortSession: ((sessionID: string) => Promise<void>) | undefined,
   opts: FallbackOptions,
   log: (level: string, msg: string) => void,
 ): Promise<void> {
@@ -159,6 +160,10 @@ async function performFallback(
     await switchModel(sessionID, providerID, modelID)
     sessionLastFailure.set(sessionID, now)
     log("info", `switch successful: ${currentModel ?? "unknown"} -> ${nextModel} (session ${sessionID})`)
+    if (abortSession) {
+      await abortSession(sessionID).catch(() => {})
+      log("info", `session ${sessionID} aborted for immediate retry`)
+    }
   } catch (e) {
     failures.add(nextModel)
     log("error", `switch failed: session ${sessionID} to ${nextModel}: ${e}`)
@@ -209,10 +214,18 @@ export default async function modelFallbackPlugin(
         sessionID,
         model: { id: modelID, providerID },
       })
+      // Interrupt the session to cancel the retry schedule — the
+      // switched model takes effect immediately for the next attempt.
+      await v2Client.v2.session.interrupt({ sessionID }).catch(() => {})
     }
   } catch {
     log("warn", "couldn't initialize v2 client; model switching disabled")
   }
+
+  // Build an abort function from the v1 client (input.client)
+  const abortSession = client?.session?.abort
+    ? (sid: string) => (client.session.abort as any)({ path: { id: sid }, query: { directory } }).catch(() => {})
+    : undefined
 
   return {
     "chat.params": async (chatInput, _output) => {
@@ -274,7 +287,7 @@ export default async function modelFallbackPlugin(
           if (sid) {
             const safeMsg = status.message.length > 200 ? status.message.slice(0, 200) + "..." : status.message
             log("info", `session ${sid} retry: ${safeMsg}`)
-            await performFallback(sid, switchModel, opts, log)
+            await performFallback(sid, switchModel, abortSession, opts, log)
           }
         }
         return
@@ -294,7 +307,7 @@ export default async function modelFallbackPlugin(
 
       if (!isRetryableError(eventAny)) return
 
-      await performFallback(sessionID, switchModel, opts, log)
+      await performFallback(sessionID, switchModel, abortSession, opts, log)
     },
   }
 }
