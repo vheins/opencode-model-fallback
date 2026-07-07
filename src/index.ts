@@ -7,11 +7,14 @@ interface FallbackOptions {
 }
 
 function parse(opts: Record<string, unknown>): FallbackOptions {
-  return {
-    fallbacks: (opts.fallbacks as Record<string, string[]>) ?? {},
-    maxRetries: (opts.maxRetries as number) ?? 3,
-    cooldownMs: (opts.cooldownMs as number) ?? 300_000,
-  }
+  const raw = opts.fallbacks
+  const fallbacks: Record<string, string[]> =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, string[]>)
+      : {}
+  const maxRetries = typeof opts.maxRetries === "number" ? opts.maxRetries : 3
+  const cooldownMs = typeof opts.cooldownMs === "number" ? opts.cooldownMs : 300_000
+  return { fallbacks, maxRetries, cooldownMs }
 }
 
 function key(providerID: string, modelID: string): string {
@@ -21,6 +24,56 @@ function key(providerID: string, modelID: string): string {
 const sessionModel = new Map<string, string>()
 const sessionFailures = new Map<string, Set<string>>()
 const sessionLastFailure = new Map<string, number>()
+const sessionRetries = new Map<string, number>()
+
+/**
+ * Extract sessionID from an event, handling both v1 (properties.sessionID)
+ * and v2 (data.sessionID) event shapes.
+ */
+function extractSessionID(event: Record<string, unknown>): string | undefined {
+  const props = event.properties as Record<string, unknown> | undefined
+  if (props?.sessionID) return props.sessionID as string
+  const data = event.data as Record<string, unknown> | undefined
+  if (data?.sessionID) return data.sessionID as string
+  return undefined
+}
+
+/**
+ * Extract the error message from an event for debugging.
+ * Handles v1/v2 ApiError and SessionErrorUnknown shapes.
+ */
+function extractErrorMessage(event: Record<string, unknown>): string | undefined {
+  const props = event.properties as Record<string, unknown> | undefined
+  if (props?.error) {
+    const err = props.error as Record<string, unknown>
+    const data = err.data as Record<string, unknown> | undefined
+    if (data?.message) return data.message as string
+    if (err.message) return err.message as string
+  }
+  const data = event.data as Record<string, unknown> | undefined
+  if (data?.error) {
+    const err = data.error as Record<string, unknown>
+    if (err.message) return err.message as string
+    const errData = err.data as Record<string, unknown> | undefined
+    if (errData?.message) return errData.message as string
+  }
+  return undefined
+}
+
+/**
+ * Check if the error is likely retryable.
+ * Falls back to true (attempt fallback) when classification is uncertain.
+ */
+function isRetryableError(event: Record<string, unknown>): boolean {
+  const props = event.properties as Record<string, unknown> | undefined
+  if (props?.error) {
+    const err = props.error as Record<string, unknown>
+    const data = err.data as Record<string, unknown> | undefined
+    if (data?.statusCode === 429 || data?.statusCode === 503) return true
+    if (data?.isRetryable === true) return true
+  }
+  return false
+}
 
 export default async function modelFallbackPlugin(
   input: PluginInput,
@@ -58,12 +111,24 @@ export default async function modelFallbackPlugin(
     },
 
     event: async ({ event }) => {
-      if (event.type !== "session.error") return
+      // Handle both session-level errors and step-level failures (e.g. stream rate-limit)
+      const eventType = (event as Record<string, unknown>).type as string
+      if (eventType !== "session.error" && eventType !== "session.next.step.failed") return
       if (!switchModel) return
 
-      const props = event.properties as Record<string, unknown>
-      const sessionID = props.sessionID as string | undefined
+      const eventAny = event as Record<string, unknown>
+      const sessionID = extractSessionID(eventAny)
       if (!sessionID) return
+
+      // Log the actual error to help users debug why fallback triggered
+      const errMsg = extractErrorMessage(eventAny)
+      if (errMsg) {
+        const safeMsg = errMsg.length > 200 ? errMsg.slice(0, 200) + "..." : errMsg
+        console.log(`[model-fallback] session ${sessionID} error: ${safeMsg}`)
+      }
+
+      // Only trigger on retryable errors (rate limit, server error, etc.)
+      if (!isRetryableError(eventAny)) return
 
       const currentModel = sessionModel.get(sessionID)
       if (!currentModel) return
@@ -73,8 +138,22 @@ export default async function modelFallbackPlugin(
 
       const now = Date.now()
       const lastFail = sessionLastFailure.get(sessionID) ?? 0
-      if (now - lastFail < opts.cooldownMs) return
 
+      // Cooldown expired → reset state so primary model gets retried
+      if (now - lastFail >= opts.cooldownMs) {
+        sessionFailures.delete(sessionID)
+        sessionRetries.delete(sessionID)
+      }
+
+      // Enforce maxRetries
+      const retries = (sessionRetries.get(sessionID) ?? 0) + 1
+      sessionRetries.set(sessionID, retries)
+      if (retries > opts.maxRetries) {
+        console.log(`[model-fallback] session ${sessionID}: max retries (${opts.maxRetries}) reached`)
+        return
+      }
+
+      // Find next untried model in the fallback chain
       let failures = sessionFailures.get(sessionID)
       if (!failures) {
         failures = new Set()
@@ -89,15 +168,18 @@ export default async function modelFallbackPlugin(
         ? [nextModel.split("/")[0], nextModel.split("/")[1]!]
         : ["", nextModel]
 
+      if (!providerID) {
+        console.warn(`[model-fallback] no provider in fallback target "${nextModel}", using empty providerID`)
+      }
+
       try {
         await switchModel(sessionID, providerID, modelID)
         sessionLastFailure.set(sessionID, now)
-        console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID})`)
+        console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID}, retry ${retries})`)
       } catch (e) {
+        failures.add(nextModel)
         console.error(`[model-fallback] failed to switch session ${sessionID} to ${nextModel}:`, e)
       }
     },
   }
 }
-
-
