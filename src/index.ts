@@ -106,13 +106,22 @@ async function performFallback(
   switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined,
   opts: FallbackOptions,
 ): Promise<void> {
-  if (!switchModel) return
+  if (!switchModel) {
+    console.log(`[model-fallback] session ${sessionID}: switchModel not available, skipping`)
+    return
+  }
 
   const currentModel = sessionModel.get(sessionID)
-  if (!currentModel) return
+  if (!currentModel) {
+    console.log(`[model-fallback] session ${sessionID}: no model in sessionModel, skipping`)
+    return
+  }
 
   const fallbackChain = opts.fallbacks[currentModel]
-  if (!fallbackChain || fallbackChain.length === 0) return
+  if (!fallbackChain || fallbackChain.length === 0) {
+    console.log(`[model-fallback] session ${sessionID}: no fallback chain for ${currentModel}, skipping`)
+    return
+  }
 
   const now = Date.now()
   const lastFail = sessionLastFailure.get(sessionID) ?? 0
@@ -140,7 +149,10 @@ async function performFallback(
   failures.add(currentModel)
 
   const nextModel = fallbackChain.find((m) => !failures!.has(m))
-  if (!nextModel) return
+  if (!nextModel) {
+    console.log(`[model-fallback] session ${sessionID}: all fallback models exhausted for ${currentModel}`)
+    return
+  }
 
   const [providerID, modelID] = nextModel.includes("/")
     ? [nextModel.split("/")[0], nextModel.split("/")[1]!]
@@ -151,12 +163,13 @@ async function performFallback(
   }
 
   try {
+    console.log(`[model-fallback] switching session ${sessionID}: ${currentModel} -> ${nextModel} (attempt ${retries})`)
     await switchModel(sessionID, providerID, modelID)
     sessionLastFailure.set(sessionID, now)
-    console.log(`[model-fallback] ${currentModel} -> ${nextModel} (session ${sessionID}, retry ${retries})`)
+    console.log(`[model-fallback] switch successful: ${currentModel} -> ${nextModel} (session ${sessionID})`)
   } catch (e) {
     failures.add(nextModel)
-    console.error(`[model-fallback] failed to switch session ${sessionID} to ${nextModel}:`, e)
+    console.error(`[model-fallback] switch failed: session ${sessionID} to ${nextModel}:`, e)
   }
 }
 
@@ -166,6 +179,7 @@ export default async function modelFallbackPlugin(
 ): Promise<Hooks> {
   const opts = parse(options ?? {})
   const fallbackKeys = Object.keys(opts.fallbacks)
+  console.log(`[model-fallback] loaded, fallbacks: ${fallbackKeys.length ? fallbackKeys.join(", ") : "none"}, maxRetries: ${opts.maxRetries}, cooldownMs: ${opts.cooldownMs}`)
   if (fallbackKeys.length === 0) return {}
 
   let switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined
@@ -198,6 +212,9 @@ export default async function modelFallbackPlugin(
     event: async ({ event }) => {
       const eventAny = event as Record<string, unknown>
       const eventType = eventAny.type as string
+      if (eventType === "session.error" || eventType === "session.status" || eventType === "session.created" || eventType === "session.next.step.started" || eventType === "session.next.step.failed") {
+        console.log(`[model-fallback] event: ${eventType}`)
+      }
 
       // Capture model from session.created events (fires for ALL sessions
       // including subagents, before any step starts).
@@ -223,7 +240,9 @@ export default async function modelFallbackPlugin(
         }
 
         if (sessionID && model?.id && model?.providerID) {
-          sessionModel.set(sessionID, key(model.providerID, model.id))
+          const k = key(model.providerID, model.id)
+          sessionModel.set(sessionID, k)
+          console.log(`[model-fallback] captured model for session ${sessionID}: ${k}`)
         }
         return
       }
@@ -245,6 +264,7 @@ export default async function modelFallbackPlugin(
       // "Free usage exceeded" goes to retry state instead of emitting an error)
       if (eventType === "session.status") {
         const status = extractStatus(eventAny)
+        console.log(`[model-fallback] session.status: ${status?.type}`)
         if (status?.type === "retry" && status.message) {
           const sid = extractSessionID(eventAny)
           if (sid) {
