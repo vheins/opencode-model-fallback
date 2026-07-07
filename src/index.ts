@@ -1,5 +1,7 @@
 import type { PluginInput, PluginOptions, Hooks } from "@opencode-ai/plugin"
 
+console.log("[model-fallback] module loaded")
+
 interface OpencodeClient {
   app: {
     log: (params: {
