@@ -101,7 +101,6 @@ function isRetryableError(event: Record<string, unknown>): boolean {
 async function performFallback(
   sessionID: string,
   switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined,
-  abortSession: ((sessionID: string) => Promise<void>) | undefined,
   opts: FallbackOptions,
   log: (level: string, msg: string) => void,
 ): Promise<void> {
@@ -162,10 +161,6 @@ async function performFallback(
     await switchModel(sessionID, providerID, modelID)
     sessionLastFailure.set(sessionID, now)
     log("info", `switch successful: ${currentModel ?? "unknown"} -> ${nextModel} (session ${sessionID})`)
-    if (abortSession) {
-      await abortSession(sessionID).catch(() => {})
-      log("info", `session ${sessionID} aborted for immediate retry`)
-    }
   } catch (e) {
     failures.add(nextModel)
     log("error", `switch failed: session ${sessionID} to ${nextModel}: ${e}`)
@@ -219,12 +214,6 @@ export default async function modelFallbackPlugin(
     }
   } catch {
     log("warn", "couldn't initialize v2 client; model switching disabled")
-  }
-
-  async function abortSession(sessionID: string): Promise<void> {
-    try {
-      await client?.session?.abort({ path: { id: sessionID }, query: { directory } })
-    } catch {}
   }
 
   return {
@@ -312,7 +301,7 @@ export default async function modelFallbackPlugin(
               blockedAgents.add(agent)
               log("info", `blocked agent: ${agent}`)
             }
-            await performFallback(sid, switchModel, abortSession, opts, log)
+            await performFallback(sid, switchModel, opts, log)
           }
         }
         return
@@ -332,7 +321,7 @@ export default async function modelFallbackPlugin(
 
       if (!isRetryableError(eventAny)) return
 
-      await performFallback(sessionID, switchModel, abortSession, opts, log)
+      await performFallback(sessionID, switchModel, opts, log)
     },
   }
 }
