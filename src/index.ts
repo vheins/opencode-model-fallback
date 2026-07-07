@@ -214,18 +214,16 @@ export default async function modelFallbackPlugin(
         sessionID,
         model: { id: modelID, providerID },
       })
-      // Interrupt the session to cancel the retry schedule — the
-      // switched model takes effect immediately for the next attempt.
-      await v2Client.v2.session.interrupt({ sessionID }).catch(() => {})
     }
   } catch {
     log("warn", "couldn't initialize v2 client; model switching disabled")
   }
 
-  // Build an abort function from the v1 client (input.client)
-  const abortSession = client?.session?.abort
-    ? (sid: string) => (client.session.abort as any)({ path: { id: sid }, query: { directory } }).catch(() => {})
-    : undefined
+  async function abortSession(sessionID: string): Promise<void> {
+    try {
+      await client?.session?.abort({ path: { id: sessionID }, query: { directory } })
+    } catch {}
+  }
 
   return {
     "chat.params": async (chatInput, _output) => {
