@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "OpenCode plugin for automatic model fallback on provider errors",
   "type": "module",
   "main": "./dist/index.js",

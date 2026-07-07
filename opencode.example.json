@@ -12,6 +12,7 @@
             "openai/gpt-4o"
           ]
         },
+        "defaultFallbacks": ["opencode/mimo-v2.5-free"],
         "maxRetries": 3,
         "cooldownMs": 300000
       }

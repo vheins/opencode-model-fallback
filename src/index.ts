@@ -2,6 +2,7 @@ import type { PluginInput, PluginOptions, Hooks } from "@opencode-ai/plugin"
 
 interface FallbackOptions {
   fallbacks: Record<string, string[]>
+  defaultFallbacks?: string[]
   maxRetries: number
   cooldownMs: number
 }
@@ -12,9 +13,14 @@ function parse(opts: Record<string, unknown>): FallbackOptions {
     raw && typeof raw === "object" && !Array.isArray(raw)
       ? (raw as Record<string, string[]>)
       : {}
+  const rawDefault = opts.defaultFallbacks
+  const defaultFallbacks: string[] | undefined =
+    Array.isArray(rawDefault) && rawDefault.length > 0
+      ? (rawDefault as string[])
+      : undefined
   const maxRetries = typeof opts.maxRetries === "number" ? opts.maxRetries : 3
   const cooldownMs = typeof opts.cooldownMs === "number" ? opts.cooldownMs : 300_000
-  return { fallbacks, maxRetries, cooldownMs }
+  return { fallbacks, defaultFallbacks, maxRetries, cooldownMs }
 }
 
 function key(providerID: string, modelID: string): string {
@@ -112,14 +118,14 @@ async function performFallback(
   }
 
   const currentModel = sessionModel.get(sessionID)
-  if (!currentModel) {
-    console.log(`[model-fallback] session ${sessionID}: no model in sessionModel, skipping`)
-    return
-  }
+  
+  // Try model-specific chain first, fall back to defaultFallbacks
+  const fallbackChain = currentModel
+    ? (opts.fallbacks[currentModel] ?? opts.defaultFallbacks)
+    : opts.defaultFallbacks
 
-  const fallbackChain = opts.fallbacks[currentModel]
   if (!fallbackChain || fallbackChain.length === 0) {
-    console.log(`[model-fallback] session ${sessionID}: no fallback chain for ${currentModel}, skipping`)
+    console.log(`[model-fallback] session ${sessionID}: no fallback chain${currentModel ? ` for ${currentModel}` : ""}, skipping`)
     return
   }
 
@@ -146,7 +152,7 @@ async function performFallback(
     failures = new Set()
     sessionFailures.set(sessionID, failures)
   }
-  failures.add(currentModel)
+  if (currentModel) failures.add(currentModel)
 
   const nextModel = fallbackChain.find((m) => !failures!.has(m))
   if (!nextModel) {
@@ -179,7 +185,7 @@ export default async function modelFallbackPlugin(
 ): Promise<Hooks> {
   const opts = parse(options ?? {})
   const fallbackKeys = Object.keys(opts.fallbacks)
-  console.log(`[model-fallback] loaded, fallbacks: ${fallbackKeys.length ? fallbackKeys.join(", ") : "none"}, maxRetries: ${opts.maxRetries}, cooldownMs: ${opts.cooldownMs}`)
+  console.log(`[model-fallback] loaded, fallbacks: ${fallbackKeys.length ? fallbackKeys.join(", ") : "none"}${opts.defaultFallbacks ? `, default: ${opts.defaultFallbacks.join(", ")}` : ""}, maxRetries: ${opts.maxRetries}, cooldownMs: ${opts.cooldownMs}`)
   if (fallbackKeys.length === 0) return {}
 
   let switchModel: ((sessionID: string, providerID: string, modelID: string) => Promise<void>) | undefined
