@@ -62,15 +62,25 @@ function extractErrorMessage(event: Record<string, unknown>): string | undefined
 
 /**
  * Check if the error is likely retryable.
- * Falls back to true (attempt fallback) when classification is uncertain.
+ *
+ * - APIError: strict classification using statusCode/isRetryable
+ * - UnknownError / unclassified: assume retryable (the error likely
+ *   wraps a provider failure like rate-limit that switching models fixes)
  */
 function isRetryableError(event: Record<string, unknown>): boolean {
   const props = event.properties as Record<string, unknown> | undefined
   if (props?.error) {
     const err = props.error as Record<string, unknown>
+    const errName = err.name as string | undefined
     const data = err.data as Record<string, unknown> | undefined
-    if (data?.statusCode === 429 || data?.statusCode === 503) return true
-    if (data?.isRetryable === true) return true
+    if (errName === "APIError") {
+      if (data?.statusCode === 429 || data?.statusCode === 503) return true
+      if (data?.isRetryable === true) return true
+      return false
+    }
+    // UnknownError or any other — assume retryable since we can't
+    // determine the nature of the provider error
+    return true
   }
   return false
 }
