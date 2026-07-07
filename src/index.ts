@@ -45,6 +45,8 @@ const sessionModel = new Map<string, string>()
 const sessionFailures = new Map<string, Set<string>>()
 const sessionLastFailure = new Map<string, number>()
 const sessionRetries = new Map<string, number>()
+const sessionAgent = new Map<string, string>()
+const blockedAgents = new Set<string>()
 
 function extractSessionID(event: Record<string, unknown>): string | undefined {
   const props = event.properties as Record<string, unknown> | undefined
@@ -242,12 +244,14 @@ export default async function modelFallbackPlugin(
       if (eventType === "session.created") {
         let sessionID: string | undefined
         let model: { id?: string; providerID?: string } | undefined
+        let agent: string | undefined
 
         const props = eventAny.properties as Record<string, unknown> | undefined
         if (props?.sessionID && props?.info) {
           const info = props.info as Record<string, unknown>
           sessionID = props.sessionID as string
           model = info.model as { id?: string; providerID?: string } | undefined
+          agent = info.agent as string | undefined
         }
         if (!sessionID) {
           const data = eventAny.data as Record<string, unknown> | undefined
@@ -255,6 +259,7 @@ export default async function modelFallbackPlugin(
             const info = data.info as Record<string, unknown>
             sessionID = data.sessionID as string
             model = info.model as { id?: string; providerID?: string } | undefined
+            agent = info.agent as string | undefined
           }
         }
 
@@ -263,6 +268,23 @@ export default async function modelFallbackPlugin(
           sessionModel.set(sessionID, k)
           log("info", `captured model for session ${sessionID}: ${k}`)
         }
+        if (sessionID && agent) {
+          sessionAgent.set(sessionID, agent)
+        }
+
+        // Proactive switch: if this agent is blocked (previously rate-limited),
+        // immediately switch to the default fallback model.
+        if (sessionID && agent && blockedAgents.has(agent) && switchModel && opts.defaultFallbacks?.length) {
+          const target = opts.defaultFallbacks[0]
+          const [pid, mid] = target.includes("/")
+            ? [target.split("/")[0], target.split("/")[1]!]
+            : ["", target]
+          log("info", `proactive switch for blocked agent ${agent} (session ${sessionID}): -> ${target}`)
+          await switchModel(sessionID, pid, mid).catch((e) =>
+            log("error", `proactive switch failed for ${target}: ${e}`),
+          )
+        }
+
         return
       }
 
@@ -285,6 +307,11 @@ export default async function modelFallbackPlugin(
           if (sid) {
             const safeMsg = status.message.length > 200 ? status.message.slice(0, 200) + "..." : status.message
             log("info", `session ${sid} retry: ${safeMsg}`)
+            const agent = sessionAgent.get(sid)
+            if (agent) {
+              blockedAgents.add(agent)
+              log("info", `blocked agent: ${agent}`)
+            }
             await performFallback(sid, switchModel, abortSession, opts, log)
           }
         }
