@@ -121,12 +121,26 @@ export default async function modelFallbackPlugin(
     },
 
     event: async ({ event }) => {
-      // Handle both session-level errors and step-level failures (e.g. stream rate-limit)
-      const eventType = (event as Record<string, unknown>).type as string
+      const eventAny = event as Record<string, unknown>
+      const eventType = eventAny.type as string
+
+      // Capture model from step-start events — this is the ONLY reliable way
+      // to get model info for subagent sessions (chat.params doesn't fire for them).
+      if (eventType === "session.next.step.started") {
+        const data = eventAny.data as Record<string, unknown> | undefined
+        if (data?.sessionID && data?.model) {
+          const model = data.model as { id?: string; providerID?: string }
+          if (model.id && model.providerID) {
+            sessionModel.set(data.sessionID as string, key(model.providerID, model.id))
+          }
+        }
+        return
+      }
+
+      // Handle session-level errors and step-level failures (e.g. stream rate-limit)
       if (eventType !== "session.error" && eventType !== "session.next.step.failed") return
       if (!switchModel) return
 
-      const eventAny = event as Record<string, unknown>
       const sessionID = extractSessionID(eventAny)
       if (!sessionID) return
 
